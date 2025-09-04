@@ -30,7 +30,7 @@ from .augment import (
     v8_transforms,
 )
 from .base import BaseDataset
-from .converter import merge_multi_segment
+from .converter import merge_multi_segment, coco91_to_coco80_class
 from .utils import (
     HELP_URL,
     check_file_speeds,
@@ -659,6 +659,212 @@ class GroundingDataset(YOLODataset):
         threshold = min(max(category_freq.values()), 100)
         return [k for k, v in category_freq.items() if v >= threshold]
 
+
+class COCODataset(YOLODataset):
+    """
+    Dataset class for loading COCO-format JSON annotations directly.
+
+    Supports detection, segmentation and keypoints depending on the selected task. It reads the COCO
+    `images`, `annotations`, and optional `categories` to construct labels in the internal YOLO format
+    without requiring YOLO txt labels.
+
+    Args:
+        json_file (str): Path to the COCO annotations JSON file (e.g., instances_train2017.json).
+        task (str): One of 'detect', 'segment', or 'pose'.
+        cls91to80 (bool): Map COCO 91 category ids to the standard 80 contiguous indices when True.
+    """
+
+    def __init__(self, *args, task: str = "detect", json_file: str = "", cls91to80: bool = True, **kwargs):
+        assert task in {"detect", "segment", "pose"}, "COCODataset supports 'detect', 'segment' and 'pose' tasks"
+        self.json_file = json_file
+        self.cls91to80 = cls91to80
+        # Provide minimal data; names can come from the external data dict passed by the trainer/YAML
+        data = kwargs.pop("data", None)
+        if data is None:
+            data = {"channels": 3}
+        elif "channels" not in data:
+            data = {**data, "channels": 3}
+        # Default keypoint shape for COCO pose if not provided
+        if task == "pose" and "kpt_shape" not in data:
+            data["kpt_shape"] = (17, 3)
+        super().__init__(*args, task=task, data=data, **kwargs)
+
+    def get_img_files(self, img_path: str) -> list:
+        """
+        Image files are determined from the JSON; return empty list here.
+        """
+        return []
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict[str, Any]:
+        """
+        Load COCO JSON, build per-image labels in normalized xywh with optional segments/keypoints.
+        """
+        x = {"labels": []}
+        LOGGER.info("Loading COCO annotation file...")
+        with open(self.json_file, encoding="utf-8") as f:
+            data = json.load(f)
+
+        images = {int(im["id"]): im for im in data["images"]}
+        annotations = defaultdict(list)
+        for ann in data["annotations"]:
+            annotations[int(ann["image_id"])].append(ann)
+
+        # Build category mappings
+        category_id_to_name = {}
+        category_id_to_index = {}
+        names_list = None
+        if "categories" in data:
+            cats = sorted(data["categories"], key=lambda c: int(c["id"]))
+            for idx, cat in enumerate(cats):
+                cid = int(cat["id"])
+                cname = cat.get("name", str(cid))
+                category_id_to_name[cid] = cname
+                category_id_to_index[cid] = idx
+            # If external names not provided, adopt COCO category names
+            if not isinstance(self.data.get("names"), (list, tuple, dict)):
+                names_list = [cat.get("name", str(cat["id"])) for cat in cats]
+                self.data["names"] = dict(enumerate(names_list))
+                self.data["nc"] = len(names_list)
+            else:
+                names_list = list(self.data["names"].values()) if isinstance(self.data["names"], dict) else list(
+                    self.data["names"]
+                )
+
+        coco91_to_80 = coco91_to_coco80_class()
+
+        for img_id, anns in TQDM(annotations.items(), desc=f"Reading COCO annotations {self.json_file}"):
+            img = images.get(int(img_id))
+            if img is None:
+                continue
+            h, w = int(img["height"]), int(img["width"])  # image size
+            im_file = Path(self.img_path) / img["file_name"]
+            if not im_file.exists():
+                continue
+            self.im_files.append(str(im_file))
+
+            bboxes = []  # list of [cls, cx, cy, w, h]
+            segments = []  # list of [cls, x1, y1, x2, y2, ...] normalized
+            keypoints = []  # list of [cls, cx, cy, w, h, kps...]
+
+            for ann in anns:
+                if ann.get("iscrowd", 0):
+                    continue
+
+                # class mapping
+                cat_id = int(ann["category_id"]) if "category_id" in ann else None
+                if cat_id is None:
+                    continue
+
+                # Determine class index
+                if names_list is not None and len(names_list) == 80 and self.cls91to80:
+                    mapped = coco91_to_80[cat_id - 1] if 1 <= cat_id <= len(coco91_to_80) else None
+                    if mapped is None:
+                        continue  # category not in 80-class subset
+                    cls_idx = int(mapped)
+                elif names_list is not None and category_id_to_name:
+                    # Map by name when possible
+                    cat_name = category_id_to_name.get(cat_id)
+                    try:
+                        cls_idx = int(names_list.index(cat_name))
+                    except Exception:
+                        # Fallback to position by id ordering if available
+                        cls_idx = category_id_to_index.get(cat_id)
+                        if cls_idx is None:
+                            continue
+                else:
+                    # Fallback to contiguous index by id ordering
+                    cls_idx = category_id_to_index.get(cat_id, None)
+                    if cls_idx is None:
+                        continue
+
+                # bbox in COCO ltwh -> YOLO xywh normalized
+                box = np.array(ann["bbox"], dtype=np.float32)
+                box[:2] += box[2:] / 2
+                box[[0, 2]] /= float(w)
+                box[[1, 3]] /= float(h)
+                if box[2] <= 0 or box[3] <= 0:
+                    continue
+
+                b = [cls_idx] + box.tolist()
+                if b not in bboxes:
+                    bboxes.append(b)
+
+                    # segments (polygons)
+                    seg = ann.get("segmentation")
+                    if self.use_segments and seg is not None:
+                        if len(seg) == 0:
+                            segments.append(b)
+                        else:
+                            if len(seg) > 1:
+                                s = merge_multi_segment(seg)
+                                s = (np.concatenate(s, axis=0) / np.array([w, h], dtype=np.float32)).reshape(-1).tolist()
+                            else:
+                                s = [j for i in seg for j in i]
+                                s = (
+                                    (np.array(s, dtype=np.float32).reshape(-1, 2) / np.array([w, h], dtype=np.float32))
+                                    .reshape(-1)
+                                    .tolist()
+                                )
+                            segments.append([cls_idx] + s)
+
+                    # keypoints
+                    if self.use_keypoints and ann.get("keypoints") is not None:
+                        kps = (
+                            np.array(ann["keypoints"], dtype=np.float32).reshape(-1, 3)
+                            / np.array([w, h, 1], dtype=np.float32)
+                        ).reshape(-1)
+                        keypoints.append(b + kps.tolist())
+
+            lb = np.array(bboxes, dtype=np.float32) if len(bboxes) else np.zeros((0, 5), dtype=np.float32)
+
+            polys = []
+            if self.use_segments:
+                if len(segments):
+                    classes = np.array([x[0] for x in segments], dtype=np.float32)
+                    polys = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in segments]
+                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(polys)), 1)
+            elif self.use_keypoints and len(keypoints):
+                lb = np.array(keypoints, dtype=np.float32)
+
+            keypoints_arr = None
+            if self.use_keypoints and len(keypoints):
+                nkpt = len(anns[0].get("keypoints", [])) // 3 if len(anns) else 0
+                if nkpt:
+                    kk = np.array(keypoints, dtype=np.float32)
+                    # shape (n, 5 + nkpt*3) -> (n, nkpt, 3)
+                    keypoints_arr = kk[:, 5 : 5 + nkpt * 3].reshape(-1, nkpt, 3)
+
+            x["labels"].append(
+                {
+                    "im_file": im_file,
+                    "shape": (h, w),
+                    "cls": lb[:, 0:1],
+                    "bboxes": lb[:, 1:5] if lb.shape[1] >= 5 else np.zeros((0, 4), dtype=np.float32),
+                    "segments": polys if self.use_segments else [],
+                    "keypoints": keypoints_arr,
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+            )
+
+        x["hash"] = get_hash(self.json_file)
+        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self) -> list[dict]:
+        cache_path = Path(self.json_file).with_suffix(".cache")
+        try:
+            cache, _ = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache["hash"] == get_hash(self.json_file)
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, _ = self.cache_labels(cache_path), False
+        [cache.pop(k) for k in ("hash", "version")]  # remove items
+        labels = cache["labels"]
+        self.im_files = [str(label["im_file"]) for label in labels]
+        if LOCAL_RANK in {-1, 0}:
+            LOGGER.info(f"Load {self.json_file} from cache file {cache_path}")
+        return labels
 
 class YOLOConcatDataset(ConcatDataset):
     """
