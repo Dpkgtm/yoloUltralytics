@@ -443,14 +443,44 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     # Set paths
     data["path"] = path  # download scripts
     for k in "train", "val", "test", "minival":
-        if data.get(k):  # prepend path
-            if isinstance(data[k], str):
-                x = (path / data[k]).resolve()
-                if not x.exists() and data[k].startswith("../"):
-                    x = (path / data[k][3:]).resolve()
-                data[k] = str(x)
+        if not data.get(k):
+            continue
+        v = data[k]
+        # Single string path
+        if isinstance(v, str):
+            x = (path / v).resolve()
+            if not x.exists() and v.startswith("../"):
+                x = (path / v[3:]).resolve()
+            data[k] = str(x)
+            continue
+        # Dict specifying a COCO JSON + image dir
+        if isinstance(v, dict):
+            if {"img_path", "json_file"}.issubset(v.keys()):
+                v = v.copy()
+                v["img_path"] = str((path / v["img_path"]).resolve())
+                v["json_file"] = str((path / v["json_file"]).resolve())
+                data[k] = v
             else:
-                data[k] = [str((path / x).resolve()) for x in data[k]]
+                # Leave unknown dicts unchanged
+                data[k] = v
+            continue
+        # List that may include strings and/or dict entries
+        if isinstance(v, list):
+            resolved_list = []
+            for item in v:
+                if isinstance(item, str):
+                    xi = (path / item).resolve()
+                    if not xi.exists() and item.startswith("../"):
+                        xi = (path / item[3:]).resolve()
+                    resolved_list.append(str(xi))
+                elif isinstance(item, dict) and {"img_path", "json_file"}.issubset(item.keys()):
+                    it = item.copy()
+                    it["img_path"] = str((path / it["img_path"]).resolve())
+                    it["json_file"] = str((path / it["json_file"]).resolve())
+                    resolved_list.append(it)
+                else:
+                    resolved_list.append(item)
+            data[k] = resolved_list
 
     # Parse YAML
     val, s = (data.get(x) for x in ("val", "download"))
