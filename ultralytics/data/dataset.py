@@ -709,11 +709,26 @@ class COCODataset(YOLODataset):
         for ann in data["annotations"]:
             annotations[int(ann["image_id"])].append(ann)
 
-        # Optional categories for name-based mapping
+        # Build category mappings
         category_id_to_name = {}
+        category_id_to_index = {}
+        names_list = None
         if "categories" in data:
-            for cat in data["categories"]:
-                category_id_to_name[int(cat["id"])] = cat.get("name", str(cat["id"]))
+            cats = sorted(data["categories"], key=lambda c: int(c["id"]))
+            for idx, cat in enumerate(cats):
+                cid = int(cat["id"])
+                cname = cat.get("name", str(cid))
+                category_id_to_name[cid] = cname
+                category_id_to_index[cid] = idx
+            # If external names not provided, adopt COCO category names
+            if not isinstance(self.data.get("names"), (list, tuple, dict)):
+                names_list = [cat.get("name", str(cat["id"])) for cat in cats]
+                self.data["names"] = dict(enumerate(names_list))
+                self.data["nc"] = len(names_list)
+            else:
+                names_list = list(self.data["names"].values()) if isinstance(self.data["names"], dict) else list(
+                    self.data["names"]
+                )
 
         coco91_to_80 = coco91_to_coco80_class()
 
@@ -740,29 +755,27 @@ class COCODataset(YOLODataset):
                 if cat_id is None:
                     continue
 
-                # Prefer explicit names mapping from external data when present
-                if isinstance(self.data.get("names"), (list, tuple, dict)):
-                    names = list(self.data["names"].values()) if isinstance(self.data["names"], dict) else list(
-                        self.data["names"]
-                    )
-                else:
-                    names = None
-
-                if names is not None and len(names) == 80 and self.cls91to80:
+                # Determine class index
+                if names_list is not None and len(names_list) == 80 and self.cls91to80:
                     mapped = coco91_to_80[cat_id - 1] if 1 <= cat_id <= len(coco91_to_80) else None
                     if mapped is None:
                         continue  # category not in 80-class subset
                     cls_idx = int(mapped)
-                elif names is not None and category_id_to_name:
+                elif names_list is not None and category_id_to_name:
                     # Map by name when possible
                     cat_name = category_id_to_name.get(cat_id)
                     try:
-                        cls_idx = int(names.index(cat_name))
+                        cls_idx = int(names_list.index(cat_name))
                     except Exception:
-                        continue
+                        # Fallback to position by id ordering if available
+                        cls_idx = category_id_to_index.get(cat_id)
+                        if cls_idx is None:
+                            continue
                 else:
-                    # Fallback to contiguous by sorted unique id (approximate: id-1)
-                    cls_idx = int(cat_id) - 1
+                    # Fallback to contiguous index by id ordering
+                    cls_idx = category_id_to_index.get(cat_id, None)
+                    if cls_idx is None:
+                        continue
 
                 # bbox in COCO ltwh -> YOLO xywh normalized
                 box = np.array(ann["bbox"], dtype=np.float32)
